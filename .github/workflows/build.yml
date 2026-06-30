@@ -10,6 +10,7 @@ on:
       - reopened
       - synchronize
     paths:
+      - metadata.json
       - submissions/**/*.svg
 
 concurrency:
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    name: Convert SVG submissions
+    name: Process icon pack changes
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     permissions:
@@ -29,6 +30,7 @@ jobs:
       VALKYRIE_SHA256: 58bd9d270706163e1b1c2ac9947e6a200ded302c638ec356ac3c126bf996588c
       SVG2VECTOR_VERSION: 2.9.1
       ICON_PACKAGE_NAME: moe.rukamori.iconpack
+      ICON_RANDOM_DIGITS: 6
 
     steps:
       - name: Require PAT
@@ -100,7 +102,8 @@ jobs:
             --base-sha "$BASE_SHA" \
             --valkyrie /tmp/valkyrie/bin/valkyrie \
             --s2v "$(command -v s2v)" \
-            --package-name "$ICON_PACKAGE_NAME"
+            --package-name "$ICON_PACKAGE_NAME" \
+            --random-digits "$ICON_RANDOM_DIGITS"
 
       - name: Commit generated vectors and metadata
         working-directory: submission
@@ -140,6 +143,7 @@ jobs:
       VALKYRIE_SHA256: 58bd9d270706163e1b1c2ac9947e6a200ded302c638ec356ac3c126bf996588c
       SVG2VECTOR_VERSION: 2.9.1
       ICON_PACKAGE_NAME: moe.rukamori.iconpack
+      ICON_RANDOM_DIGITS: 6
 
     steps:
       - name: Require branch and PAT
@@ -192,7 +196,8 @@ jobs:
             --mode rebuild \
             --valkyrie /tmp/valkyrie/bin/valkyrie \
             --s2v "$(command -v s2v)" \
-            --package-name "$ICON_PACKAGE_NAME"
+            --package-name "$ICON_PACKAGE_NAME" \
+            --random-digits "$ICON_RANDOM_DIGITS"
 
       - name: Commit reconciled icon pack
         env:

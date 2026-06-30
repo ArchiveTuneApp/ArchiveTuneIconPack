@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -23,6 +24,7 @@ MAX_SVG_BYTES = 1_000_000
 PACKAGE_NAME_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
 )
+MAX_FILENAME_COMPONENT_LENGTH = 48
 
 
 class SubmissionError(Exception):
@@ -37,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valkyrie", type=Path, required=True)
     parser.add_argument("--s2v", type=Path, required=True)
     parser.add_argument("--package-name", required=True)
+    parser.add_argument("--random-digits", type=int, choices=(6,), default=6)
     return parser.parse_args()
 
 
@@ -166,7 +169,7 @@ def validate_pr_changes(
         generated_change = any(
             path == "metadata.json"
             or path.startswith("pack/")
-            or path.startswith("svg/")
+            or path.startswith("xml/")
             for _, path in changes
         )
         if generated_change:
@@ -245,41 +248,294 @@ def read_metadata(path: Path) -> list[dict[str, Any]]:
     return metadata
 
 
-def used_ids(metadata: list[dict[str, Any]]) -> set[str]:
+def read_metadata_at_revision(revision: str) -> list[dict[str, Any]]:
+    try:
+        metadata = json.loads(run("git", "show", f"{revision}:metadata.json"))
+    except (json.JSONDecodeError, subprocess.CalledProcessError) as error:
+        raise SubmissionError(
+            f"Cannot read metadata.json at revision {revision}: {error}"
+        ) from error
+    if not isinstance(metadata, list) or not all(
+        isinstance(entry, dict) for entry in metadata
+    ):
+        raise SubmissionError(
+            f"metadata.json at revision {revision} must be an array of objects."
+        )
+    return metadata
+
+
+def workflow_message(value: str) -> str:
+    return (
+        value.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def warn_duplicate_authors(
+    icons: list[dict[str, str]], metadata: list[dict[str, Any]]
+) -> None:
+    existing_authors = {
+        entry["Author"]
+        for entry in metadata
+        if isinstance(entry.get("Author"), str)
+    }
+    duplicate_authors = sorted(
+        {
+            icon["author"]
+            for icon in icons
+            if icon["author"] in existing_authors
+        }
+    )
+    for author in duplicate_authors:
+        message = workflow_message(
+            f'Author "{author}" already exists in metadata.json. '
+            "Confirm that this submission uses the intended author name."
+        )
+        print(f"::warning title=Duplicate author name::{message}")
+
+
+def used_ids(
+    metadata: list[dict[str, Any]], random_digits: int
+) -> set[str]:
+    identifier_pattern = re.compile(rf"\d{{{random_digits}}}")
+    filename_pattern = re.compile(rf"_(\d{{{random_digits}}})(?:\.|$)")
     identifiers = {
         str(entry["Id"])
         for entry in metadata
         if isinstance(entry.get("Id"), (str, int))
-        and re.fullmatch(r"\d{4}", str(entry["Id"]))
+        and identifier_pattern.fullmatch(str(entry["Id"]))
     }
-    for directory, pattern in ((Path("pack"), "Icon????.kt"), (Path("xml"), "????.xml")):
-        for path in directory.glob(pattern):
-            match = re.search(r"(\d{4})", path.name)
+    for directory in (Path("pack"), Path("xml")):
+        for path in directory.iterdir() if directory.is_dir() else ():
+            match = filename_pattern.search(path.name)
             if match:
                 identifiers.add(match.group(1))
     return identifiers
 
 
-def next_id(existing: set[str]) -> str:
-    if len(existing) >= 9000:
-        raise SubmissionError("All four-digit icon IDs are already in use.")
+def next_id(existing: set[str], random_digits: int) -> str:
+    lower_bound = 10 ** (random_digits - 1)
+    available_identifiers = 9 * lower_bound
+    if len(existing) >= available_identifiers:
+        raise SubmissionError(
+            f"All {random_digits}-digit icon IDs are already in use."
+        )
     while True:
-        identifier = f"{secrets.randbelow(9000) + 1000:04d}"
+        identifier = str(secrets.randbelow(available_identifiers) + lower_bound)
         if identifier not in existing:
             existing.add(identifier)
             return identifier
+
+
+def kotlin_filename_component(value: str, fallback: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    words = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    component = "".join(word[:1].upper() + word[1:] for word in words)
+    if not component:
+        component = fallback
+    return component[:MAX_FILENAME_COMPONENT_LENGTH] or fallback
+
+
+def xml_filename_component(value: str, fallback: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    component = re.sub(r"[^a-z0-9]+", "_", ascii_value.lower()).strip("_")
+    return component[:MAX_FILENAME_COMPONENT_LENGTH].rstrip("_") or fallback
+
+
+def kotlin_asset_stem(name: str, author: str, identifier: str) -> str:
+    icon_name = kotlin_filename_component(name, "Icon")
+    author_name = kotlin_filename_component(author, "Author")
+    return f"Icon{icon_name}By{author_name}{identifier}"
+
+
+def xml_asset_stem(name: str, author: str, identifier: str) -> str:
+    icon_name = xml_filename_component(name, "icon")
+    author_name = xml_filename_component(author, "author")
+    return f"{icon_name}_{author_name}_{identifier}"
+
+
+def metadata_by_id(
+    metadata: list[dict[str, Any]], source: str
+) -> dict[str, dict[str, Any]]:
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(metadata, start=1):
+        identifier = entry.get("Id")
+        if not isinstance(identifier, (str, int)):
+            raise SubmissionError(f"{source} entry #{index} requires an Id.")
+        normalized_identifier = str(identifier)
+        if re.fullmatch(r"\d{4}|\d{6}", normalized_identifier) is None:
+            raise SubmissionError(
+                f'{source} entry #{index} has invalid Id "{normalized_identifier}".'
+            )
+        if normalized_identifier in entries_by_id:
+            raise SubmissionError(
+                f'{source} contains duplicate Id "{normalized_identifier}".'
+            )
+        entries_by_id[normalized_identifier] = entry
+    return entries_by_id
+
+
+def metadata_text(
+    entry: dict[str, Any], field: str, identifier: str
+) -> str:
+    value = entry.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise SubmissionError(
+            f'Metadata entry with Id "{identifier}" requires a {field}.'
+        )
+    return value.strip()
+
+
+def asset_filename(
+    entry: dict[str, Any], field: str, identifier: str
+) -> str:
+    value = entry.get(field)
+    if (
+        not isinstance(value, str)
+        or not value
+        or Path(value).name != value
+    ):
+        raise SubmissionError(
+            f'Metadata entry with Id "{identifier}" requires a valid {field}.'
+        )
+    return value
+
+
+def renamed_kotlin_content(
+    source: Path, previous_symbol: str, expected_symbol: str
+) -> str:
+    try:
+        content = source.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SubmissionError(
+            f"Cannot read generated Kotlin asset {source.as_posix()}: {error}"
+        ) from error
+    if previous_symbol == expected_symbol:
+        return content
+
+    symbol_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(previous_symbol)}"
+        rf"(?![A-Za-z0-9_])"
+    )
+    updated_content, replacement_count = symbol_pattern.subn(
+        expected_symbol, content
+    )
+    if replacement_count == 0:
+        raise SubmissionError(
+            f"{source.as_posix()} does not contain its expected generated "
+            f'symbol "{previous_symbol}".'
+        )
+    return updated_content
+
+
+def synchronize_metadata_assets(
+    metadata: list[dict[str, Any]],
+    base_metadata: list[dict[str, Any]],
+) -> int:
+    entries_by_id = metadata_by_id(metadata, "metadata.json")
+    base_entries_by_id = metadata_by_id(
+        base_metadata, "base metadata.json"
+    )
+    updated_entries = [
+        (identifier, entry, base_entries_by_id[identifier])
+        for identifier, entry in entries_by_id.items()
+        if identifier in base_entries_by_id
+        and entry != base_entries_by_id[identifier]
+    ]
+    synchronized_count = 0
+
+    for identifier, entry, base_entry in updated_entries:
+        name = metadata_text(entry, "Name", identifier)
+        author = metadata_text(entry, "Author", identifier)
+        expected_symbol = kotlin_asset_stem(name, author, identifier)
+        expected_filename = f"{expected_symbol}.kt"
+        expected_source = (
+            f"{xml_asset_stem(name, author, identifier)}.xml"
+        )
+        previous_filename = asset_filename(
+            base_entry, "Filename", identifier
+        )
+        previous_source = asset_filename(base_entry, "Source", identifier)
+        previous_symbol = Path(previous_filename).stem
+        previous_pack_path = Path("pack") / previous_filename
+        expected_pack_path = Path("pack") / expected_filename
+        previous_xml_path = Path("xml") / previous_source
+        expected_xml_path = Path("xml") / expected_source
+
+        if expected_pack_path != previous_pack_path:
+            if expected_pack_path.exists() and previous_pack_path.exists():
+                raise SubmissionError(
+                    f"Cannot rename {previous_pack_path.as_posix()} because "
+                    f"{expected_pack_path.as_posix()} already exists."
+                )
+            if previous_pack_path.is_file():
+                updated_content = renamed_kotlin_content(
+                    previous_pack_path,
+                    previous_symbol,
+                    expected_symbol,
+                )
+                expected_pack_path.write_text(
+                    updated_content, encoding="utf-8"
+                )
+                previous_pack_path.unlink()
+            elif not expected_pack_path.is_file():
+                raise SubmissionError(
+                    f'Cannot find Kotlin asset for Id "{identifier}".'
+                )
+        elif expected_pack_path.is_file():
+            updated_content = renamed_kotlin_content(
+                expected_pack_path,
+                previous_symbol,
+                expected_symbol,
+            )
+            if updated_content != expected_pack_path.read_text(encoding="utf-8"):
+                expected_pack_path.write_text(
+                    updated_content, encoding="utf-8"
+                )
+        else:
+            raise SubmissionError(
+                f'Cannot find Kotlin asset for Id "{identifier}".'
+            )
+
+        if expected_xml_path != previous_xml_path:
+            if expected_xml_path.exists() and previous_xml_path.exists():
+                raise SubmissionError(
+                    f"Cannot rename {previous_xml_path.as_posix()} because "
+                    f"{expected_xml_path.as_posix()} already exists."
+                )
+            if previous_xml_path.is_file():
+                previous_xml_path.rename(expected_xml_path)
+            elif not expected_xml_path.is_file():
+                raise SubmissionError(
+                    f'Cannot find XML asset for Id "{identifier}".'
+                )
+        elif not expected_xml_path.is_file():
+            raise SubmissionError(
+                f'Cannot find XML asset for Id "{identifier}".'
+            )
+
+        entry["Id"] = identifier
+        entry["Name"] = name
+        entry["Author"] = author
+        entry["Filename"] = expected_filename
+        entry["Source"] = expected_source
+        synchronized_count += 1
+
+    return synchronized_count
 
 
 def convert_icon(
     valkyrie: Path,
     source: Path,
     destination: Path,
-    identifier: str,
+    generated_name: str,
     package_name: str,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="valkyrie-") as temporary_directory:
         temporary = Path(temporary_directory)
-        staged_svg = temporary / f"Icon{identifier}.svg"
+        staged_svg = temporary / f"{generated_name}.svg"
         output = temporary / "output"
         shutil.copyfile(source, staged_svg)
         try:
@@ -308,10 +564,10 @@ def convert_icon(
             raise SubmissionError(
                 f"Valkyrie could not convert {source.as_posix()}."
             ) from error
-        generated = output / f"Icon{identifier}.kt"
+        generated = output / f"{generated_name}.kt"
         if not generated.is_file():
             raise SubmissionError(
-                f"Valkyrie did not produce the expected Icon{identifier}.kt file."
+                f"Valkyrie did not produce the expected {generated_name}.kt file."
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(generated, destination)
@@ -360,29 +616,56 @@ def process_pull_request(args: argparse.Namespace) -> None:
         raise SubmissionError(
             "Pull-request mode requires --event-path and --base-sha."
         )
-    icons = parse_form(read_pr_body(args.event_path))
     changes = changed_paths(args.base_sha)
+    if not any(path.startswith("submissions/") for _, path in changes):
+        if not any(path == "metadata.json" for _, path in changes):
+            print("No unprocessed SVG submissions remain; nothing to do.")
+            return
+
+        metadata_path = Path("metadata.json")
+        metadata = read_metadata(metadata_path)
+        base_metadata = read_metadata_at_revision(args.base_sha)
+        synchronized_count = synchronize_metadata_assets(
+            metadata, base_metadata
+        )
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"Synchronized {synchronized_count} metadata asset set(s)."
+        )
+        return
+
+    icons = parse_form(read_pr_body(args.event_path))
     if not validate_pr_changes(changes, icons):
         return
 
     metadata_path = Path("metadata.json")
     metadata = read_metadata(metadata_path)
-    identifiers = used_ids(metadata)
+    base_metadata = read_metadata_at_revision(args.base_sha)
+    warn_duplicate_authors(icons, base_metadata)
+    identifiers = used_ids(metadata, args.random_digits)
     Path("pack").mkdir(exist_ok=True)
     Path("xml").mkdir(exist_ok=True)
 
     for icon in icons:
         submission = Path(icon["file"])
         validate_svg(submission)
-        identifier = next_id(identifiers)
-        kotlin_filename = f"Icon{identifier}.kt"
-        xml_filename = f"{identifier}.xml"
+        identifier = next_id(identifiers, args.random_digits)
+        generated_name = kotlin_asset_stem(
+            icon["name"], icon["author"], identifier
+        )
+        kotlin_filename = f"{generated_name}.kt"
+        xml_filename = (
+            f"{xml_asset_stem(icon['name'], icon['author'], identifier)}.xml"
+        )
 
         convert_icon(
             valkyrie=args.valkyrie,
             source=submission,
             destination=Path("pack") / kotlin_filename,
-            identifier=identifier,
+            generated_name=generated_name,
             package_name=args.package_name,
         )
         convert_android_vector(
@@ -424,7 +707,7 @@ def metadata_matches_submission(
             and Path(filename).name == filename
             and Path(filename).stem == submission.stem
         )
-        or (re.fullmatch(r"\d{4}", identifier) is not None
+        or (re.fullmatch(r"\d{4}|\d{6}", identifier) is not None
             and submission.name == f"{identifier}.svg")
     )
 
@@ -495,7 +778,7 @@ def rebuild_existing_icons(args: argparse.Namespace) -> None:
     metadata_path = Path("metadata.json")
     metadata = read_metadata(metadata_path)
     submissions = sorted(Path("submissions").glob("*.svg"))
-    identifiers = used_ids(metadata)
+    identifiers = used_ids(metadata, args.random_digits)
     rebuilt_count = 0
 
     for submission in submissions:
@@ -516,13 +799,20 @@ def rebuild_existing_icons(args: argparse.Namespace) -> None:
 
         entry = matches[0]
         identifier = str(entry.get("Id", ""))
-        if not identifier:
-            identifier = next_id(identifiers)
-        elif re.fullmatch(r"\d{4}", identifier) is None:
+        if re.fullmatch(rf"\d{{{args.random_digits}}}", identifier) is None:
+            identifier = next_id(identifiers, args.random_digits)
+        name = entry.get("Name")
+        author = entry.get("Author")
+        if not isinstance(name, str) or not name.strip():
             raise SubmissionError(
-                f"{submission.as_posix()} metadata Id must be four digits."
+                f"{submission.as_posix()} metadata requires a Name."
             )
-        expected_filename = f"Icon{identifier}.kt"
+        if not isinstance(author, str) or not author.strip():
+            raise SubmissionError(
+                f"{submission.as_posix()} metadata requires an Author."
+            )
+        generated_name = kotlin_asset_stem(name, author, identifier)
+        expected_filename = f"{generated_name}.kt"
         previous_filename = entry.get("Filename")
         if not isinstance(previous_filename, str) or not previous_filename:
             raise SubmissionError(
@@ -538,18 +828,27 @@ def rebuild_existing_icons(args: argparse.Namespace) -> None:
             valkyrie=args.valkyrie,
             source=submission,
             destination=Path("pack") / expected_filename,
-            identifier=identifier,
+            generated_name=generated_name,
             package_name=args.package_name,
         )
         previous_asset = Path("pack") / previous_filename
         if previous_asset.name != expected_filename:
             previous_asset.unlink(missing_ok=True)
-        generated_xml = Path("xml") / f"{identifier}.xml"
+        previous_source = entry.get("Source")
+        generated_xml = Path("xml") / (
+            f"{xml_asset_stem(name, author, identifier)}.xml"
+        )
         convert_android_vector(
             s2v=args.s2v,
             source=submission,
             destination=generated_xml,
         )
+        if (
+            isinstance(previous_source, str)
+            and Path(previous_source).name == previous_source
+            and previous_source != generated_xml.name
+        ):
+            (Path("xml") / previous_source).unlink(missing_ok=True)
         submission.unlink()
         entry["Id"] = identifier
         entry["Filename"] = expected_filename
