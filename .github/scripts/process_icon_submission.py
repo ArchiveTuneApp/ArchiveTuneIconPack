@@ -22,7 +22,7 @@ ALLOWED_FIELDS = frozenset((*REQUIRED_FIELDS, "link"))
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
-MAX_SVG_BYTES = 1_000_000
+MAX_SVG_BYTES = 700_000
 SVG_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
 SVG_TRANSLATE_PATTERN = re.compile(
     rf"\s*translate\(\s*({SVG_NUMBER})(?:[\s,]+({SVG_NUMBER}))?\s*\)\s*"
@@ -45,7 +45,11 @@ class SubmissionError(Exception):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("pull-request", "rebuild"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("pull-request", "rebuild", "update"),
+        required=True,
+    )
     parser.add_argument("--event-path", type=Path)
     parser.add_argument("--base-sha")
     parser.add_argument("--valkyrie", type=Path, required=True)
@@ -949,6 +953,66 @@ def metadata_matches_submission(
     )
 
 
+def metadata_submission_path(
+    entry: dict[str, Any],
+    identifier: str,
+) -> PurePosixPath:
+    value = entry.get("Submission")
+    if not isinstance(value, str):
+        raise SubmissionError(
+            f'Metadata entry with Id "{identifier}" requires a Submission.'
+        )
+    submission = PurePosixPath(value)
+    if (
+        submission.is_absolute()
+        or len(submission.parts) != 2
+        or submission.parts[0] != "submissions"
+        or submission.suffix.lower() != ".svg"
+        or submission.name in {".svg", ".."}
+    ):
+        raise SubmissionError(
+            f'Metadata entry with Id "{identifier}" has an invalid Submission.'
+        )
+    return submission
+
+
+def restore_submission_from_history(
+    submission: PurePosixPath,
+    destination: Path,
+) -> None:
+    current_submission = Path(submission.as_posix())
+    if current_submission.is_file() and not current_submission.is_symlink():
+        shutil.copyfile(current_submission, destination)
+        return
+
+    revisions = run(
+        "git",
+        "log",
+        "--all",
+        "--format=%H",
+        "--",
+        submission.as_posix(),
+    ).splitlines()
+    for revision in revisions:
+        result = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{revision}:{submission.as_posix()}",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0 and result.stdout:
+            destination.write_bytes(result.stdout)
+            return
+
+    raise SubmissionError(
+        f"Cannot restore {submission.as_posix()} from Git history."
+    )
+
+
 def reconcile_icon_pack(
     metadata: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int, int]:
@@ -1108,6 +1172,101 @@ def rebuild_existing_icons(args: argparse.Namespace) -> None:
     )
 
 
+def update_existing_icons(args: argparse.Namespace) -> None:
+    metadata_path = Path("metadata.json")
+    metadata = read_metadata(metadata_path)
+    entries_by_id = metadata_by_id(metadata, "metadata.json")
+
+    with tempfile.TemporaryDirectory(prefix="icon-pack-update-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        source_directory = temporary / "submissions"
+        staged_pack_directory = temporary / "pack"
+        staged_xml_directory = temporary / "xml"
+        source_directory.mkdir()
+        staged_pack_directory.mkdir()
+        staged_xml_directory.mkdir()
+
+        expected_pack_files: set[str] = set()
+        expected_xml_files: set[str] = set()
+        restored_submissions: set[str] = set()
+
+        for identifier, entry in entries_by_id.items():
+            name = metadata_text(entry, "Name", identifier)
+            author = metadata_text(entry, "Author", identifier)
+            submission = metadata_submission_path(entry, identifier)
+            normalized_submission = submission.as_posix()
+            if normalized_submission in restored_submissions:
+                raise SubmissionError(
+                    f'Multiple metadata entries reference "{normalized_submission}".'
+                )
+            restored_submissions.add(normalized_submission)
+
+            source = source_directory / f"{identifier}.svg"
+            restore_submission_from_history(submission, source)
+            validate_svg(source)
+
+            generated_name = kotlin_asset_stem(name, author, identifier)
+            kotlin_filename = f"{generated_name}.kt"
+            xml_filename = (
+                f"{xml_asset_stem(name, author, identifier)}.xml"
+            )
+            if kotlin_filename in expected_pack_files:
+                raise SubmissionError(
+                    f'Duplicate generated Kotlin filename "{kotlin_filename}".'
+                )
+            if xml_filename in expected_xml_files:
+                raise SubmissionError(
+                    f'Duplicate generated XML filename "{xml_filename}".'
+                )
+            expected_pack_files.add(kotlin_filename)
+            expected_xml_files.add(xml_filename)
+
+            convert_icon(
+                valkyrie=args.valkyrie,
+                source=source,
+                destination=staged_pack_directory / kotlin_filename,
+                generated_name=generated_name,
+                package_name=args.package_name,
+            )
+            convert_android_vector(
+                s2v=args.s2v,
+                source=source,
+                destination=staged_xml_directory / xml_filename,
+            )
+
+            entry["Id"] = identifier
+            entry["Name"] = name
+            entry["Author"] = author
+            entry["Filename"] = kotlin_filename
+            entry["Source"] = xml_filename
+            entry["Submission"] = normalized_submission
+
+        Path("pack").mkdir(exist_ok=True)
+        Path("xml").mkdir(exist_ok=True)
+        for staged_file in staged_pack_directory.iterdir():
+            shutil.move(staged_file, Path("pack") / staged_file.name)
+        for staged_file in staged_xml_directory.iterdir():
+            shutil.move(staged_file, Path("xml") / staged_file.name)
+
+    metadata, removed_metadata_count, removed_file_count = reconcile_icon_pack(
+        metadata
+    )
+    if removed_metadata_count:
+        raise SubmissionError(
+            "Metadata reconciliation unexpectedly removed "
+            f"{removed_metadata_count} record(s)."
+        )
+
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"Updated {len(metadata)} icon(s) and removed "
+        f"{removed_file_count} obsolete file(s)."
+    )
+
+
 def process(args: argparse.Namespace) -> None:
     if not PACKAGE_NAME_PATTERN.fullmatch(args.package_name):
         raise SubmissionError("The configured Kotlin package name is invalid.")
@@ -1120,8 +1279,10 @@ def process(args: argparse.Namespace) -> None:
 
     if args.mode == "pull-request":
         process_pull_request(args)
-    else:
+    elif args.mode == "rebuild":
         rebuild_existing_icons(args)
+    else:
+        update_existing_icons(args)
 
 
 def main() -> int:
